@@ -51,32 +51,52 @@ team_t team = {
 
 #define MIN(x, y) ((x) > (y) ? (y) : (x))
 
+// 주소 + 할당여부
 #define PACK(size, alloc) ((size) | (alloc))
 
+// 포인터의 값 구하기
 #define GET(p) (*(unsigned int *)(p))
+// 포인터의 값 넣기
 #define PUT(p, val) (*(unsigned int *)(p) = (val))
 
+// 이번 블럭의 크기 구하기
 #define GET_SIZE(p) (GET(p) & ~0x7)
+// 이번 블럭의 할당 여부 구하기
 #define GET_ALLOC(p) (GET(p) & 0x1)
 
+// 현재 블럭의 header, footer 주소
 #define HDRP(bp) ((char *)(bp) - WSIZE)
 #define FTRP(bp) ((char *)(bp) + GET_SIZE(HDRP(bp)) - DSIZE)
 
+// 이전, 다음 블럭 payload 주소
 #define NEXT_BRKP(bp) ((char *)(bp) + GET_SIZE(((char *)(bp)) - WSIZE))
 #define PREV_BRKP(bp) ((char *)(bp) - GET_SIZE(((char *)(bp)) - DSIZE))
 
+// 이전, 다음 free 블럭 주소
+#define PREV_FREE(bp) (*(char **)(bp))
+#define NEXT_FREE(bp) (*(char **)((bp) + sizeof(void *)))
+
+// heap의 시작 주소
 static char * heap_list_p;
 
+// free linked list의 시작 주소
+static char * free_list_p;
+
+// 미리 선언해야하는 함수들
 static void *extended_heap(size_t words);
 static void *coalesce(void *ptr);
 static void *find_fit(size_t asize);
 static void *place(char *bp, size_t asize);
+
+static void *insert_freelist(char *bp);
+static void *remove_freelist(char *bp);
 
 /*
  * mm_init - initialize the malloc package.
  */
 int mm_init(void)
 {
+    free_list_p = NULL;
     // exception
     if ((heap_list_p = mem_sbrk(4*WSIZE)) == (void *)(-1)) {
         return -1;
@@ -94,9 +114,12 @@ int mm_init(void)
 
     heap_list_p += 2*WSIZE;
 
-    // if (extended_heap(CHUNKSIZE/WSIZE) == NULL) {
-    //     return -1;
-    // }
+    if ((free_list_p = extended_heap(CHUNKSIZE/WSIZE)) == NULL) {
+        return -1;
+    }
+
+    PREV_FREE(free_list_p) = NULL;
+    NEXT_FREE(free_list_p) = NULL;
     return 0;
 }
 
@@ -120,21 +143,25 @@ void *mm_malloc(size_t size)
     size_t extendsize;
     char *bp;
 
+    // 예외처리
     if (size == 0) {
         return NULL;
     }
 
+    // 주어진 payload -> asize로 바꾸는 과정
     if (size < DSIZE) {
-        asize = 2 * DSIZE;
+        asize = 2 * DSIZE + DSIZE;
     } else {
-        asize = DSIZE * ((size + DSIZE + (DSIZE - 1)) / DSIZE);
+        asize = (DSIZE * ((size + DSIZE + (DSIZE - 1)) / DSIZE)) + DSIZE;
     }
 
+    // find_fit에 성공하면, place로 split 할지 정하기 
     if ((bp = find_fit(asize)) != NULL) {
         place(bp, asize);
         return bp;
     }
 
+    // find_fit 실패해서 extended_heap을 해야하는 경우 -> 늘려주고, place로 split 할지 정하기
     extendsize = MAX(asize, CHUNKSIZE) / WSIZE;
     if ((bp = extended_heap(extendsize)) == NULL) {
         return NULL;
@@ -156,9 +183,12 @@ static void *extended_heap(size_t words) {
     }
     PUT(HDRP(bp), PACK(size, 0));
     PUT(FTRP(bp), PACK(size, 0));
+    // epilogue header
     PUT(HDRP(NEXT_BRKP(bp)), PACK(0, 1));
 
-    return coalesce(bp);
+    void *temp = coalesce(bp);
+    insert_freelist(temp);
+    return temp;
 }
 
 /*
@@ -171,7 +201,8 @@ void mm_free(void *ptr)
     PUT(HDRP(ptr), PACK(size, 0));
     PUT(FTRP(ptr), PACK(size, 0));
     // coalescing 해야함
-    coalesce(ptr);
+    void *free_ptr = coalesce(ptr);
+    insert_freelist(free_ptr);
 }
 
 static void *coalesce(void *ptr) {
@@ -186,6 +217,7 @@ static void *coalesce(void *ptr) {
     // case 2. 앞 블럭 alloc 0 뒤 블럭 alloc 1
     else if (!prev_alloc && next_alloc) {
         char * prev = PREV_BRKP(ptr);
+        remove_freelist(prev);
         PUT(FTRP(ptr), PACK((size + GET_SIZE(HDRP(prev))), 0));
         PUT(HDRP(prev), PACK((size + GET_SIZE(HDRP(prev))), 0));
         ptr = prev;
@@ -193,6 +225,7 @@ static void *coalesce(void *ptr) {
     // case 3. 앞 블럭 alloc 1 뒤 블럭 alloc 0
     else if (prev_alloc && !next_alloc) {
         char * next = NEXT_BRKP(ptr);
+        remove_freelist(next);
         PUT(HDRP(ptr), PACK((size + GET_SIZE(HDRP(next))), 0));
         PUT(FTRP(next), PACK((size + GET_SIZE(HDRP(next))), 0));
     }
@@ -200,6 +233,8 @@ static void *coalesce(void *ptr) {
     else {
         char * prev = PREV_BRKP(ptr);
         char * next = NEXT_BRKP(ptr);
+        remove_freelist(prev);
+        remove_freelist(next);
         PUT(FTRP(next), PACK((size + GET_SIZE(HDRP(prev)) + GET_SIZE(HDRP(next))), 0));
         PUT(HDRP(prev), PACK((size + GET_SIZE(HDRP(prev)) + GET_SIZE(HDRP(next))), 0));
         ptr = prev;
@@ -209,23 +244,24 @@ static void *coalesce(void *ptr) {
 
 // free된 블럭 중 할당할 수 있는 공간 찾기
 static void *find_fit(size_t asize) {
-    char * bp = heap_list_p + GET_SIZE(HDRP(heap_list_p));
+    char * bp = free_list_p;
 
     while (1) {
         // epilogue 만나면 종료
-        if (GET_SIZE(HDRP(bp)) == 0) {
+        if (bp == 0) {
             break;
         }
+        // free인 블록
         if (GET_ALLOC(HDRP(bp)) == 0) {
+            // 의 크기가 지금 할당하려는 asize보다 크다면
             if (GET_SIZE(HDRP(bp)) >= asize) {
                 return bp;
             } else {
-                bp = NEXT_BRKP(bp);
+                bp = NEXT_FREE(bp);
             }
         } else {
-            bp = NEXT_BRKP(bp);
+            bp = NEXT_FREE(bp);
         }
-        
     }
     return NULL;
 }
@@ -234,12 +270,15 @@ static void *find_fit(size_t asize) {
 static void *place(char *bp, size_t asize) {
     size_t size = GET_SIZE(HDRP(bp));
 
-    if (size - asize >= 16) {
+    if (size - asize >= 24) {
+        remove_freelist(bp);
         PUT(HDRP(bp), PACK(asize, 1));
         PUT(FTRP(bp), PACK(asize, 1));
         PUT(HDRP(NEXT_BRKP(bp)), PACK(size-asize, 0));
         PUT(FTRP(NEXT_BRKP(bp)), PACK(size-asize, 0));
+        insert_freelist(NEXT_BRKP(bp));
     } else {
+        remove_freelist(bp);
         PUT(HDRP(bp), PACK(size, 1));
         PUT(FTRP(bp), PACK(size, 1));
     }
@@ -281,18 +320,21 @@ void *mm_realloc(void *ptr, size_t size)
     size_t asize;
 
     if (size < DSIZE) {
-        asize = 2 * DSIZE;
+        asize = (2 * DSIZE) + DSIZE;
     } else {
-        asize = DSIZE * ((size + DSIZE + (DSIZE - 1)) / DSIZE);
+        asize = (DSIZE * ((size + DSIZE + (DSIZE - 1)) / DSIZE)) + DSIZE;
     }
 
     if (GET_ALLOC(HDRP(next)) == 0 && (old_size + GET_SIZE(HDRP(next))) >= asize) {
-        if (old_size + GET_SIZE(HDRP(next)) - asize >= 16) {
+        if (old_size + GET_SIZE(HDRP(next)) - asize >= 24) {
+            remove_freelist(next);
             PUT(HDRP(ptr), PACK(asize, 1));
             PUT(FTRP(ptr), PACK(asize, 1));
             PUT(HDRP(NEXT_BRKP(ptr)), PACK(old_size + GET_SIZE(HDRP(next)) - asize, 0));
             PUT(FTRP(NEXT_BRKP(ptr)), PACK(old_size + GET_SIZE(HDRP(next)) - asize, 0));
+            insert_freelist(NEXT_BRKP(ptr));
         } else {
+            remove_freelist(next);
             PUT(HDRP(ptr), PACK(old_size + GET_SIZE(HDRP(next)), 1));
             PUT(FTRP(ptr), PACK(old_size + GET_SIZE(HDRP(next)), 1));
         }
@@ -301,16 +343,58 @@ void *mm_realloc(void *ptr, size_t size)
     } else {
         if ((bp = find_fit(asize)) != NULL) {
             place(bp, asize);
-            memcpy(bp, ptr, MIN(old_size-8, size));
+            memcpy(bp, ptr, MIN(old_size-(2 * WSIZE), size));
             mm_free(ptr);
             return bp;
         } else {
             extended_heap(asize / WSIZE);
             bp = find_fit(asize);
             place(bp, asize);
-            memcpy(bp, ptr, MIN(old_size-8, size));
+            memcpy(bp, ptr, MIN(old_size-(2 * WSIZE), size));
             mm_free(ptr);
             return bp;
         }
     }
 }
+
+static void *insert_freelist(char *bp) {
+    void * temp = free_list_p;
+    if (temp == NULL) {
+        NEXT_FREE(bp) = NULL;
+        PREV_FREE(bp) = NULL;
+        free_list_p = bp;
+    } else {
+        NEXT_FREE(bp) = temp;
+        PREV_FREE(bp) = NULL;
+        PREV_FREE(temp) = bp;
+        free_list_p = bp;
+    }
+}
+
+static void *remove_freelist(char *bp) {
+    void *prev = PREV_FREE(bp);
+    void *next = NEXT_FREE(bp);
+
+    if (!prev && !next) {
+        free_list_p = NULL;
+    } else if (prev && !next) {
+        NEXT_FREE(prev) = NULL;
+    } else if (!prev && next) {
+        PREV_FREE(next) = NULL;
+        free_list_p = next;
+    } else {
+        NEXT_FREE(prev) = next;
+        PREV_FREE(next) = prev;
+    }
+}
+
+// explicit 구현 과정
+// block 구조 확장
+// free list의 시작점 관리
+// find_fit 변경
+// place 변경 (할당 시 처리)
+// free 변경
+// coalescing 변경
+// free list insert
+// free list remove
+// mm_realloc 고려
