@@ -87,6 +87,7 @@ static void *extended_heap(size_t words);
 static void *coalesce(void *ptr);
 static void *find_fit(size_t asize);
 static void *place(char *bp, size_t asize);
+static void *best_fit(size_t size);
 
 static void *insert_freelist(char *bp);
 static void *remove_freelist(char *bp);
@@ -156,7 +157,7 @@ void *mm_malloc(size_t size)
     }
 
     // find_fit에 성공하면, place로 split 할지 정하기 
-    if ((bp = find_fit(asize)) != NULL) {
+    if ((bp = best_fit(asize)) != NULL) {
         place(bp, asize);
         return bp;
     }
@@ -242,7 +243,7 @@ static void *coalesce(void *ptr) {
     return ptr;
 }
 
-// free된 블럭 중 할당할 수 있는 공간 찾기
+// free된 블럭 중 할당할 수 있는 공간 찾기 (first-fit)
 static void *find_fit(size_t asize) {
     char * bp = free_list_p;
 
@@ -264,6 +265,32 @@ static void *find_fit(size_t asize) {
         }
     }
     return NULL;
+}
+
+static void *best_fit(size_t size) {
+    char *bp = free_list_p;
+    char *temp = NULL;
+
+    while (bp != NULL) {
+        if (GET_ALLOC(HDRP(bp)) == 0) {
+            if (GET_SIZE(HDRP(bp)) >= size) {
+                if (temp != NULL) {
+                    if (GET_SIZE(HDRP(bp)) - size <= GET_SIZE(HDRP(temp)) - size) {
+                        temp = bp;
+                    }
+                } else {
+                    temp = bp;
+                }
+                
+                bp = NEXT_FREE(bp);
+            } else {
+                bp = NEXT_FREE(bp);
+            }
+        } else {
+            bp = NEXT_FREE(bp);
+        }
+    }
+    return temp;
 }
 
 // free된 블럭에 malloc을 하고 남은 공간에 대한 split, 남은 공간이 작으면 그냥 padding으로 처리
@@ -341,14 +368,14 @@ void *mm_realloc(void *ptr, size_t size)
             
             return ptr;
     } else {
-        if ((bp = find_fit(asize)) != NULL) {
+        if ((bp = best_fit(asize)) != NULL) {
             place(bp, asize);
             memcpy(bp, ptr, MIN(old_size-(2 * WSIZE), size));
             mm_free(ptr);
             return bp;
         } else {
             extended_heap(asize / WSIZE);
-            bp = find_fit(asize);
+            bp = best_fit(asize);
             place(bp, asize);
             memcpy(bp, ptr, MIN(old_size-(2 * WSIZE), size));
             mm_free(ptr);
@@ -357,6 +384,7 @@ void *mm_realloc(void *ptr, size_t size)
     }
 }
 
+// freelist_pointer의 맨 앞에 free된 블럭 넣기
 static void *insert_freelist(char *bp) {
     void * temp = free_list_p;
     if (temp == NULL) {
@@ -371,6 +399,7 @@ static void *insert_freelist(char *bp) {
     }
 }
 
+// 할당된 free 블럭 freelist에서 제거하기
 static void *remove_freelist(char *bp) {
     void *prev = PREV_FREE(bp);
     void *next = NEXT_FREE(bp);
@@ -398,3 +427,12 @@ static void *remove_freelist(char *bp) {
 // free list insert
 // free list remove
 // mm_realloc 고려
+
+// seglist 구현 과정
+// explicit에서 좀더 발전한 형태.
+// 원래는 포인터를 1개만 두고 돌았다면, 이젠 포인터를 여러개 두고선 해당하는 포인터만 순회
+// 그래서 best fit 까지 구현하는게 여러모로 더 좋을 것 같다는 생각이 들긴 함.
+// seglist에서 포인터 관리만 해주면 사실상 원래는 
+// 그냥 무조건 포인터의 맨 앞 이였는데, 특정 인덱스 포인터의 맨 앞으로 수정
+// 이것도 포인터 정렬이 들어가면 더 빨라질 것 같긴 한데, 얼마나 효율이 좋아질까?
+// explicit인 상황인데, 여기서 best fit을 구현해볼까?
