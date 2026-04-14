@@ -76,11 +76,19 @@ team_t team = {
 #define PREV_FREE(bp) (*(char **)(bp))
 #define NEXT_FREE(bp) (*(char **)((bp) + sizeof(void *)))
 
+// 메타데이터의 list_p 관리
+#define PUT_NULL(idx) (*(void **)(idx) = (void *)(NULL))
+#define PUT_PTR(idx, p) (*(void **)(idx) = (void *)(p))
+#define GET_PTR(idx) (*(void **)(idx))
+
 // heap의 시작 주소
 static char * heap_list_p;
 
 // free linked list의 시작 주소
 static char * free_list_p;
+
+// seglist metadata의 시작 주소
+static char * metadata_list_p;
 
 // 미리 선언해야하는 함수들
 static void *extended_heap(size_t words);
@@ -92,12 +100,27 @@ static void *best_fit(size_t size);
 static void *insert_freelist(char *bp);
 static void *remove_freelist(char *bp);
 
+static int size_to_idx(char *bp);
+
 /*
  * mm_init - initialize the malloc package.
  */
 int mm_init(void)
 {
-    free_list_p = NULL;
+    metadata_list_p = NULL;
+    if ((metadata_list_p = mem_sbrk(7 * DSIZE)) == (void *)(-1)) {
+        return -1;
+    }
+    
+    PUT_NULL(metadata_list_p);
+    PUT_NULL(metadata_list_p + 1 * DSIZE);
+    PUT_NULL(metadata_list_p + 2 * DSIZE);
+    PUT_NULL(metadata_list_p + 3 * DSIZE);
+    PUT_NULL(metadata_list_p + 4 * DSIZE);
+    PUT_NULL(metadata_list_p + 5 * DSIZE);
+    PUT_NULL(metadata_list_p + 6 * DSIZE);
+
+    // free_list_p = NULL;
     // exception
     if ((heap_list_p = mem_sbrk(4*WSIZE)) == (void *)(-1)) {
         return -1;
@@ -119,8 +142,8 @@ int mm_init(void)
         return -1;
     }
 
-    PREV_FREE(free_list_p) = NULL;
-    NEXT_FREE(free_list_p) = NULL;
+    // PREV_FREE(free_list_p) = NULL;
+    // NEXT_FREE(free_list_p) = NULL;
     return 0;
 }
 
@@ -268,26 +291,49 @@ static void *find_fit(size_t asize) {
 }
 
 static void *best_fit(size_t size) {
-    char *bp = free_list_p;
+    int idx;
+    int temp_size = size;
+    if (temp_size < 32) {
+        idx = 0;
+    }
+
+    if (temp_size >= 1024) {
+        idx = 6;
+    }
+
+    if (temp_size >= 32 && temp_size < 1024) {
+        temp_size = temp_size >> 4;
+        int cycle = 0;
+        while (temp_size != 1) {
+            cycle += 1;
+            temp_size = temp_size >> 1;
+        }
+        idx = cycle;
+    }
+    
+    char *bp = GET_PTR(metadata_list_p + (idx * DSIZE));
     char *temp = NULL;
 
-    while (bp != NULL) {
-        if (GET_ALLOC(HDRP(bp)) == 0) {
-            if (GET_SIZE(HDRP(bp)) >= size) {
-                if (temp != NULL) {
-                    if (GET_SIZE(HDRP(bp)) - size <= GET_SIZE(HDRP(temp)) - size) {
+    for (int i = idx; i < 7; i++) {
+        char *bp = GET_PTR(metadata_list_p + (i * DSIZE));
+        while (bp != NULL) {
+            if (GET_ALLOC(HDRP(bp)) == 0) {
+                if (GET_SIZE(HDRP(bp)) >= size) {
+                    if (temp != NULL) {
+                        if (GET_SIZE(HDRP(bp)) - size <= GET_SIZE(HDRP(temp)) - size) {
+                            temp = bp;
+                        }
+                    } else {
                         temp = bp;
                     }
+                    
+                    bp = NEXT_FREE(bp);
                 } else {
-                    temp = bp;
+                    bp = NEXT_FREE(bp);
                 }
-                
-                bp = NEXT_FREE(bp);
             } else {
                 bp = NEXT_FREE(bp);
             }
-        } else {
-            bp = NEXT_FREE(bp);
         }
     }
     return temp;
@@ -365,8 +411,7 @@ void *mm_realloc(void *ptr, size_t size)
             PUT(HDRP(ptr), PACK(old_size + GET_SIZE(HDRP(next)), 1));
             PUT(FTRP(ptr), PACK(old_size + GET_SIZE(HDRP(next)), 1));
         }
-            
-            return ptr;
+        return ptr;
     } else {
         if ((bp = best_fit(asize)) != NULL) {
             place(bp, asize);
@@ -386,35 +431,58 @@ void *mm_realloc(void *ptr, size_t size)
 
 // freelist_pointer의 맨 앞에 free된 블럭 넣기
 static void *insert_freelist(char *bp) {
-    void * temp = free_list_p;
+    int idx = size_to_idx(bp);
+    void * temp = GET_PTR(metadata_list_p + (idx * DSIZE));
+    // void * temp = free_list_p;
     if (temp == NULL) {
         NEXT_FREE(bp) = NULL;
         PREV_FREE(bp) = NULL;
-        free_list_p = bp;
+        PUT_PTR((metadata_list_p + (idx * DSIZE)), bp);
     } else {
         NEXT_FREE(bp) = temp;
         PREV_FREE(bp) = NULL;
         PREV_FREE(temp) = bp;
-        free_list_p = bp;
+        PUT_PTR((metadata_list_p + (idx * DSIZE)), bp);
     }
 }
 
 // 할당된 free 블럭 freelist에서 제거하기
 static void *remove_freelist(char *bp) {
+    int idx = size_to_idx(bp);
     void *prev = PREV_FREE(bp);
     void *next = NEXT_FREE(bp);
 
     if (!prev && !next) {
-        free_list_p = NULL;
+        PUT_NULL((metadata_list_p + (idx * DSIZE)));
     } else if (prev && !next) {
         NEXT_FREE(prev) = NULL;
     } else if (!prev && next) {
         PREV_FREE(next) = NULL;
-        free_list_p = next;
+        PUT_PTR((metadata_list_p + (idx * DSIZE)), next);
     } else {
         NEXT_FREE(prev) = next;
         PREV_FREE(next) = prev;
     }
+}
+
+// size -> index로 만드는 함수
+static int size_to_idx(char * bp) {
+    int size = GET_SIZE(HDRP(bp));
+    if (size < 32) {
+        return 0;
+    }
+
+    if (size >= 1024) {
+        return 6;
+    }
+
+    size = size >> 4;
+    int cycle = 0;
+    while (size != 1) {
+        cycle += 1;
+        size = size >> 1;
+    }
+    return cycle;
 }
 
 // explicit 구현 과정
